@@ -1,0 +1,11 @@
+# Node / Bun
+node_modules/
+
+# Per-plugin internal planning docs (kept local, not published)
+*/BACKLOG.md
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
