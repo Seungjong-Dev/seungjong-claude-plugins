@@ -34,7 +34,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 
-const PLUGIN_VERSION = '0.1.0'
+const PLUGIN_VERSION = '0.1.1'
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
 if (!AGENT || !/^[a-z0-9_-]{1,32}$/.test(AGENT)) {
@@ -65,14 +65,35 @@ function writeRegistration(): void {
   }
   writeFileSync(MY_REGISTRATION, JSON.stringify(payload, null, 2), { mode: 0o600 })
 }
+
+// If another live process already claims this agent name, it's likely an
+// orphan from a previous session (e.g. a stale --bg-spare that inherited our
+// env). We still take ownership — last writer wins — and the pid checks in
+// ownsInbox()/the signal handlers neutralize the stale process from then on.
+try {
+  const prev = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
+  if (prev.pid !== process.pid && isPidAlive(prev.pid)) {
+    process.stderr.write(
+      `local-ipc: agent "${AGENT}" already registered by live pid ${prev.pid}; ` +
+        `taking over ownership as pid ${process.pid} (stale process will stop draining)\n`,
+    )
+  }
+} catch {
+  // No previous registration (or unreadable) — nothing to warn about.
+}
 writeRegistration()
 
 // Graceful cleanup — remove our registration so peers immediately see us as
 // gone. Non-graceful exits (SIGKILL, crash) will leave the file; next startup
-// overwrites it.
+// overwrites it. Only unlink if we still own the registration: a stale
+// process (same agent name) dying later must not destroy the current owner's
+// file (2026-06-08: momo's registration wiped by a zombie's cleanup).
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
   process.on(sig, () => {
-    try { unlinkSync(MY_REGISTRATION) } catch {}
+    try {
+      const reg = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
+      if (reg.pid === process.pid) unlinkSync(MY_REGISTRATION)
+    } catch {}
     process.exit(0)
   })
 }
@@ -211,10 +232,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 })
 
 /**
+ * Check that we still own this agent's registration (registered.json pid ===
+ * process.pid). The inbox follows registration ownership: a newer server for
+ * the same agent name overwrites registered.json at startup, which revokes a
+ * stale process's right to drain — otherwise the stale watcher races us and
+ * messages evaporate into a dead session (2026-06-08 zombie --bg-spare bug).
+ * A missing/corrupt file or a dead owner means nobody holds the inbox, so we
+ * reclaim it by rewriting our own registration.
+ */
+function ownsInbox(): boolean {
+  let reg: Registration
+  try {
+    reg = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
+  } catch {
+    writeRegistration() // missing or corrupt — reclaim
+    return true
+  }
+  if (reg.pid === process.pid) return true
+  if (isPidAlive(reg.pid)) {
+    process.stderr.write(
+      `local-ipc: inbox for "${AGENT}" is owned by live pid ${reg.pid}, not us (pid ${process.pid}); skipping drain\n`,
+    )
+    return false
+  }
+  writeRegistration() // owner is dead — take over
+  return true
+}
+
+/**
  * Drain the inbox: read every pending message, deliver to Claude, unlink.
  * Sorted by filename (timestamp-prefixed) to preserve order.
  */
 function drainInbox(): void {
+  if (!ownsInbox()) return
   let files: string[]
   try {
     files = readdirSync(MY_INBOX).filter(f => f.endsWith('.json')).sort()
