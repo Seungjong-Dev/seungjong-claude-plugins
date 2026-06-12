@@ -436,8 +436,10 @@ watch(MY_INBOX, { persistent: true }, () => {
 // can fire too early to wake an idle agent. We re-send a bounded reminder while
 // open tasks persist (env-overridable for tests). The durable record is the safety
 // net: after the budget is spent the agent can still find tasks via my_tasks.
-const RENUDGE_INTERVAL_MS = Number(process.env.LOCAL_IPC_RENUDGE_MS) || 20_000
-const MAX_RENUDGES = Number(process.env.LOCAL_IPC_RENUDGE_MAX) || 6
+// Explicit undefined check (not `|| default`) so `LOCAL_IPC_RENUDGE_MAX=0` can
+// disable reminders rather than silently falling back to the default.
+const RENUDGE_INTERVAL_MS = process.env.LOCAL_IPC_RENUDGE_MS !== undefined ? Number(process.env.LOCAL_IPC_RENUDGE_MS) : 20_000
+const MAX_RENUDGES = process.env.LOCAL_IPC_RENUDGE_MAX !== undefined ? Number(process.env.LOCAL_IPC_RENUDGE_MAX) : 6
 
 /** Send one coalesced "you have N open task(s)" wake notification. */
 function sendTaskNudge(count: number): void {
