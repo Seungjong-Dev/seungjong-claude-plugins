@@ -3,6 +3,7 @@ node_modules/
 
 # Per-plugin internal planning docs (kept local, not published)
 */BACKLOG.md
+docs/superpowers/
 
 # macOS
 .DS_Store
