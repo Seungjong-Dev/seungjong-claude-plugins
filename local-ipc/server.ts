@@ -44,7 +44,7 @@ import {
 /** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
 const PROCESS_START_ISO = new Date().toISOString()
 
-const PLUGIN_VERSION = '0.2.0'
+const PLUGIN_VERSION = '0.2.1'
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
 if (!AGENT || !isValidAgentName(AGENT)) {
@@ -98,15 +98,26 @@ writeRegistration()
 // overwrites it. Only unlink if we still own the registration: a stale
 // process (same agent name) dying later must not destroy the current owner's
 // file (2026-06-08: momo's registration wiped by a zombie's cleanup).
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-  process.on(sig, () => {
-    try {
-      const reg = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
-      if (reg.pid === process.pid) unlinkSync(MY_REGISTRATION)
-    } catch {}
-    process.exit(0)
-  })
+function releaseAndExit(): void {
+  try {
+    const reg = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
+    if (reg.pid === process.pid) unlinkSync(MY_REGISTRATION)
+  } catch {}
+  process.exit(0)
 }
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  process.on(sig, releaseAndExit)
+}
+
+// The stdio transport only listens for stdin 'data'/'error', never EOF. When the
+// client disconnects (e.g. the plugin is disabled), the parent closes our stdin
+// but the transport never notices — leaving this process orphaned (ppid=1) still
+// watching inboxes. Stacked across reloads, those zombie watchers each drain and
+// deliver, causing duplicate messages. Treat stdin end/close as a disconnect and
+// reap ourselves so only one live watcher per agent survives.
+process.stdin.on('end', releaseAndExit)
+process.stdin.on('close', releaseAndExit)
 
 const mcp = new Server(
   { name: 'local-ipc', version: PLUGIN_VERSION },
@@ -392,6 +403,15 @@ function drainInbox(): void {
   }
 }
 
+// Only once the client finishes initializing can it actually receive channel
+// notifications. Deliver anything queued while we were offline here, rather than
+// firing the initial task nudge blindly at boot (which races the not-yet-ready
+// connection). Idempotent: drainInbox unlinks; nudgeTasks stamps + self-heals.
+mcp.oninitialized = () => {
+  drainInbox()
+  nudgeTasks()
+}
+
 const transport = new StdioServerTransport()
 await mcp.connect(transport)
 
@@ -431,10 +451,11 @@ function scheduleNudge(): void {
   nudgeTimer = setTimeout(() => { nudgeTimer = null; nudgeTasks() }, 150)
 }
 
-// Reclaim disk from old terminal tasks, deliver queued nudges, then watch.
+// Reclaim disk from old terminal tasks, then watch for new ones. The initial
+// nudge for already-queued tasks is delivered from mcp.oninitialized (above),
+// once the client is ready to receive it.
 mkdirSync(tasksDir(BASE), { recursive: true, mode: 0o700 })
 gcTerminalTasks(BASE, Date.now())
-nudgeTasks()
 watch(tasksDir(BASE), { persistent: true }, () => scheduleNudge())
 
 process.stderr.write(`local-ipc: agent=${AGENT} inbox=${MY_INBOX} tasks=${tasksDir(BASE)}\n`)
