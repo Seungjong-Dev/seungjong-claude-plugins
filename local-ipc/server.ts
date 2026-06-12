@@ -44,7 +44,7 @@ import {
 /** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
 const PROCESS_START_ISO = new Date().toISOString()
 
-const PLUGIN_VERSION = '0.2.1'
+const PLUGIN_VERSION = '0.2.2'
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
 if (!AGENT || !isValidAgentName(AGENT)) {
@@ -406,25 +406,27 @@ function drainInbox(): void {
   }
 }
 
-// The initial task nudge must wait until the client can actually receive channel
-// notifications; firing it at boot races the not-yet-ready connection, which left
-// offline-queued tasks undelivered on launch/reconnect. Messages don't need this
-// (they drain at startup and via the inbox watch). nudgeTasks is idempotent — it
-// stamps nudged_at and self-heals stale stamps left by a prior owner.
+// Deliver nothing until the client finishes initializing. Pre-init channel
+// notifications are dropped by the client (confirmed: a reconnect nudge fired at
+// ~116ms was lost), and draining the inbox pre-init would unlink offline messages
+// into the void. So the initial drain + nudge AND the watch callbacks are gated on
+// clientReady: pre-init arrivals are caught by this initial scan, later ones by the
+// watches. drainInbox unlinks; nudgeTasks stamps + self-heals — both idempotent.
+let clientReady = false
 mcp.oninitialized = () => {
+  clientReady = true
+  drainInbox()
   nudgeTasks()
 }
 
 const transport = new StdioServerTransport()
 await mcp.connect(transport)
 
-// Deliver anything queued while we were offline, then watch for new files.
-drainInbox()
-
-// fs.watch on macOS (FSEvents) fires on directory mutations. Debounce isn't
-// needed here — drainInbox is idempotent and cheap.
+// fs.watch on macOS (FSEvents) fires on directory mutations. drainInbox is
+// idempotent and cheap; gate on clientReady so we never deliver before the client
+// can receive (the initial drain happens in mcp.oninitialized above).
 watch(MY_INBOX, { persistent: true }, () => {
-  drainInbox()
+  if (clientReady) drainInbox()
 })
 
 // --- Task primitive: watch _store/tasks/ and nudge ourselves about open tasks. ---
@@ -459,6 +461,8 @@ function scheduleNudge(): void {
 // once the client is ready to receive it.
 mkdirSync(tasksDir(BASE), { recursive: true, mode: 0o700 })
 gcTerminalTasks(BASE, Date.now())
-watch(tasksDir(BASE), { persistent: true }, () => scheduleNudge())
+watch(tasksDir(BASE), { persistent: true }, () => {
+  if (clientReady) scheduleNudge()
+})
 
 process.stderr.write(`local-ipc: agent=${AGENT} inbox=${MY_INBOX} tasks=${tasksDir(BASE)}\n`)
