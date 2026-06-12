@@ -162,3 +162,27 @@ export const failTask = (base: string, id: string, error: string | undefined, no
   transitionTask(base, id, 'failed', { error }, now)
 export const cancelTask = (base: string, id: string, now: string): TaskRecord =>
   transitionTask(base, id, 'cancelled', {}, now)
+
+/**
+ * Which open tasks for an agent still need a nudge. A task needs nudging if it
+ * was never nudged, OR last nudged before `processStartIso` — meaning a previous
+ * or zombie owner stamped it but THIS session never delivered it. Self-heals lost
+ * nudges (ownership flips, fs.watch misses) without flooding. ISO-8601 UTC (`Z`)
+ * strings compare lexicographically === chronologically.
+ */
+export function tasksToNudge(records: TaskRecord[], processStartIso: string): TaskRecord[] {
+  return records.filter(
+    r => r.status === 'open' && (r.nudged_at === null || r.nudged_at < processStartIso),
+  )
+}
+
+/** Stamp `nudged_at` on records that are still open (re-read to avoid clobbering). */
+export function stampNudged(base: string, recs: TaskRecord[], nowIso: string): void {
+  const dir = tasksDir(base)
+  for (const rec of recs) {
+    const file = _internal.taskFilename(rec.target, rec.id)
+    const fresh = _internal.readTaskFile(dir, file)
+    if (!fresh || fresh.status !== 'open') continue
+    atomicWrite(dir, file, JSON.stringify({ ...fresh, nudged_at: nowIso }, null, 2))
+  }
+}

@@ -71,3 +71,33 @@ test('invalid transition rejects with current state', () => {
 test('transition on missing task throws not found', () => {
   expect(() => claimTask(base, 'nope', T0)).toThrow(/not found/)
 })
+
+import { tasksToNudge, stampNudged } from '../tasks'
+
+const START = '2026-06-12T12:00:00.000Z'
+
+test('tasksToNudge picks open tasks never nudged', () => {
+  const open = { status: 'open', nudged_at: null } as any
+  expect(tasksToNudge([open], START).length).toBe(1)
+})
+
+test('tasksToNudge skips open tasks nudged after this process started', () => {
+  const fresh = { status: 'open', nudged_at: '2026-06-12T12:30:00.000Z' } as any
+  expect(tasksToNudge([fresh], START).length).toBe(0)
+})
+
+test('tasksToNudge re-nudges open tasks stamped before this process (zombie heal)', () => {
+  const stale = { status: 'open', nudged_at: '2026-06-12T11:00:00.000Z' } as any
+  expect(tasksToNudge([stale], START).length).toBe(1)
+})
+
+test('tasksToNudge ignores non-open tasks', () => {
+  const claimed = { status: 'claimed', nudged_at: null } as any
+  expect(tasksToNudge([claimed], START).length).toBe(0)
+})
+
+test('stampNudged writes nudged_at only on still-open records', () => {
+  const r = assignTask(base, { target: 'momo', title: 'a', createdBy: 'main' }, T0)
+  stampNudged(base, [r], START)
+  expect(getTask(base, r.id)?.nudged_at).toBe(START)
+})
