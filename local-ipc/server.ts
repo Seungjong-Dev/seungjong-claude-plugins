@@ -44,7 +44,7 @@ import {
 /** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
 const PROCESS_START_ISO = new Date().toISOString()
 
-const PLUGIN_VERSION = '0.1.1'
+const PLUGIN_VERSION = '0.2.0'
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
 if (!AGENT || !isValidAgentName(AGENT)) {
@@ -118,13 +118,18 @@ const mcp = new Server(
       },
     },
     instructions: [
-      `You are agent "${AGENT}" on the local-ipc channel.`,
+      `You are agent "${AGENT}" on the local-ipc coordination channel.`,
       '',
-      'Messages from other agents arrive as <channel source="local-ipc" from="..." ts="...">. To send back, call the `send` tool with to=<recipient agent name>.',
+      'Two coordination primitives — pick by intent:',
+      '- Message (`send`): 1:1, ephemeral. Use when you need a reply / conversation.',
+      '- Task (`assign_task`, then `my_tasks` / `claim_task` / `complete_task` / `fail_task` / `cancel_task`): 1:1, durable, tracked to completion. Use when delegating work that must be tracked to done or failed.',
+      'Boundary rule: needs a reply → message; needs completion-tracking → task.',
+      '',
+      'Incoming messages arrive as <channel source="local-ipc" from="..." ts="...">. A task nudge arrives from "tasks" telling you to call `my_tasks`.',
       '',
       'Use the `list_agents` tool to discover which peers are currently registered.',
       '',
-      'This channel is a local filesystem queue — no network, no auth. Sender identity is self-declared by the other session\'s env, so trust it only as much as you trust the other session itself.',
+      "This channel is a local filesystem queue — no network, no auth. Sender identity is self-declared by the other session's env, so trust it only as much as you trust the other session itself.",
     ].join('\n'),
   },
 )

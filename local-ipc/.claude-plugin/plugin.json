@@ -1,6 +1,6 @@
 {
   "name": "local-ipc",
-  "description": "Local inter-session IPC channel for Claude Code — two or more Claude Code sessions on the same machine exchange messages via a filesystem queue. Each session is identified by the LOCAL_IPC_AGENT_NAME env var set by its launcher.",
-  "version": "0.1.1",
-  "keywords": ["ipc", "channel", "multi-agent", "mcp"]
+  "description": "Local agent coordination for Claude Code — co-located Claude Code sessions exchange directed messages and durable, completion-tracked tasks via a filesystem queue. Each session is identified by the LOCAL_IPC_AGENT_NAME env var set by its launcher.",
+  "version": "0.2.0",
+  "keywords": ["ipc", "channel", "multi-agent", "coordination", "task", "orchestration", "agent", "mcp"]
 }

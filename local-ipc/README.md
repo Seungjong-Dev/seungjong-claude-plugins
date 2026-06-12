@@ -59,6 +59,16 @@ $LOCAL_IPC_DIR/<recipient>/inbox/<ts>-<uuid>.json
 - **Outgoing**: call the `send` tool with `{ to: "<recipient>", text: "..." }`
 - **Discovery**: call the `list_agents` tool to see which peers are currently registered (with `alive` liveness hint via signal 0)
 
+## Tasks (durable delegation)
+
+Beyond ephemeral messages, agents can delegate **tasks** — durable records tracked to completion. Use a message when you need a reply; use a task when work must be tracked to done/failed.
+
+- **Create**: `assign_task { target, title, body?, priority? }` — writes a durable record for `target` (offline targets are queued and delivered on their next launch).
+- **Receive**: the target is nudged (`from="tasks"`) to call `my_tasks`, which lists tasks where it is the target (defaults to open + claimed).
+- **Lifecycle**: `claim_task { id }` (open → claimed) → `complete_task { id, result? }` (→ done) or `fail_task { id, error? }` (→ failed). `cancel_task { id }` cancels an open/claimed task. Transitions are idempotent.
+
+Records live at `~/.claude/channels/local-ipc/_store/tasks/<target>__<id>.json` (`schema_version: 1`); terminal tasks (done/failed/cancelled) are garbage-collected after 7 days. Writes are atomic (tmp + `rename()`). Delivery reuses the same single-owner (`ownsInbox`) gate as the message inbox, so a zombie same-name session can't steal nudges; because the record is the source of truth, a missed nudge is recovered on the next launch or `my_tasks` call.
+
 ## Notes
 
 - No auth, no network. Sender identity is self-declared by `$LOCAL_IPC_AGENT_NAME`
