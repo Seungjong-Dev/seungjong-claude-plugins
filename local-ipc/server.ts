@@ -44,7 +44,7 @@ import {
 /** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
 const PROCESS_START_ISO = new Date().toISOString()
 
-const PLUGIN_VERSION = '0.2.2'
+const PLUGIN_VERSION = '0.2.3'
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
 if (!AGENT || !isValidAgentName(AGENT)) {
@@ -135,9 +135,9 @@ const mcp = new Server(
       `You are agent "${AGENT}" on the local-ipc coordination channel.`,
       '',
       'Two coordination primitives — pick by intent:',
-      '- Message (`send`): 1:1, ephemeral. Use when you need a reply / conversation.',
-      '- Task (`assign_task`, then `my_tasks` / `claim_task` / `complete_task` / `fail_task` / `cancel_task`): 1:1, durable, tracked to completion. Use when delegating work that must be tracked to done or failed.',
-      'Boundary rule: needs a reply → message; needs completion-tracking → task.',
+      '- Message (`send`): 1:1, ephemeral, best-effort (at-most-once). Use for replies / conversation. A message sent to an offline peer can be missed on its reconnect — do not use messages for work that must not be lost.',
+      '- Task (`assign_task`, then `my_tasks` / `claim_task` / `complete_task` / `fail_task` / `cancel_task`): 1:1, durable, tracked to completion. Use when delegating work that must be tracked or must survive the target being offline.',
+      'Boundary rule: needs a reply → message; needs completion-tracking or guaranteed delivery → task.',
       '',
       'Incoming messages arrive as <channel source="local-ipc" from="..." ts="...">. A task nudge arrives from "tasks" telling you to call `my_tasks`.',
       '',
@@ -431,23 +431,50 @@ watch(MY_INBOX, { persistent: true }, () => {
 
 // --- Task primitive: watch _store/tasks/ and nudge ourselves about open tasks. ---
 
-/** Deliver one coalesced nudge for our open-and-undelivered tasks, then stamp. */
+// A channel nudge only triggers an agent turn once the session is in steady-state
+// idle-listening, which is later than the MCP init handshake — so the first nudge
+// can fire too early to wake an idle agent. We re-send a bounded reminder while
+// open tasks persist (env-overridable for tests). The durable record is the safety
+// net: after the budget is spent the agent can still find tasks via my_tasks.
+const RENUDGE_INTERVAL_MS = Number(process.env.LOCAL_IPC_RENUDGE_MS) || 20_000
+const MAX_RENUDGES = Number(process.env.LOCAL_IPC_RENUDGE_MAX) || 6
+
+/** Send one coalesced "you have N open task(s)" wake notification. */
+function sendTaskNudge(count: number): void {
+  mcp
+    .notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `📥 You have ${count} open task(s). Call \`my_tasks\` to see them.`,
+        meta: { from: 'tasks', ts: new Date().toISOString() },
+      },
+    })
+    .catch(err => process.stderr.write(`local-ipc: failed to deliver task nudge: ${err}\n`))
+}
+
+/** Immediate nudge for newly-arrived or prior-owner-stamped open tasks, then stamp. */
 function nudgeTasks(): void {
   if (!ownsInbox()) return // same single-owner gate as inbox drain
   const open = listTasks(BASE, AGENT, ['open'])
   const due = tasksToNudge(open, PROCESS_START_ISO)
   if (due.length === 0) return
-  mcp
-    .notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content: `📥 You have ${open.length} open task(s). Call \`my_tasks\` to see them.`,
-        meta: { from: 'tasks', ts: new Date().toISOString() },
-      },
-    })
-    .catch(err => process.stderr.write(`local-ipc: failed to deliver task nudge: ${err}\n`))
+  sendTaskNudge(open.length)
   stampNudged(BASE, due, new Date().toISOString())
 }
+
+// Periodic reminder so a nudge that fired before the agent was wake-ready still
+// lands. Budget refills once the agent catches up (no open tasks), so a later
+// batch gets fresh reminders; while exhausted we stay quiet and rely on my_tasks.
+let remindBudget = MAX_RENUDGES
+function remindOpenTasks(): void {
+  if (!clientReady || !ownsInbox()) return
+  const open = listTasks(BASE, AGENT, ['open'])
+  if (open.length === 0) { remindBudget = MAX_RENUDGES; return }
+  if (remindBudget <= 0) return
+  remindBudget--
+  sendTaskNudge(open.length)
+}
+setInterval(remindOpenTasks, RENUDGE_INTERVAL_MS).unref?.()
 
 // Coalesce bursty fs.watch events into one nudge pass.
 let nudgeTimer: ReturnType<typeof setTimeout> | null = null

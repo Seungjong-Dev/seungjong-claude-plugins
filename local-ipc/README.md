@@ -72,8 +72,8 @@ Records live at `~/.claude/channels/local-ipc/_store/tasks/<target>__<id>.json` 
 ## Notes
 
 - No auth, no network. Sender identity is self-declared by `$LOCAL_IPC_AGENT_NAME`
-- Offline messages queue in the recipient's inbox and deliver on next launch (server drains on connect)
-- Messages are unlinked after delivery — no replay
+- Messages are **best-effort (at-most-once)**: delivered once via a channel push, then unlinked — no replay. A message queued for an offline peer is drained on its next launch, but the push only wakes the session once it's in steady-state idle-listening, so a message delivered during that startup window can be missed. **If a message must not be lost, use a task** — its durable record survives and the recipient can always pull it with `my_tasks`.
+- Tasks re-nudge the target a few times (default every 20s, see `LOCAL_IPC_RENUDGE_MS` / `LOCAL_IPC_RENUDGE_MAX`) so the wake lands even if the first nudge was too early; after that the durable record remains pullable
 - `registered.json` is refreshed on every startup and removed on graceful shutdown (SIGKILL leaves a stale file; next startup overwrites)
 
 ## Environment variables
@@ -82,6 +82,8 @@ Records live at `~/.claude/channels/local-ipc/_store/tasks/<target>__<id>.json` 
 |---|---|---|
 | `LOCAL_IPC_AGENT_NAME` | (required) | This session's agent name. Must be set by launcher. |
 | `LOCAL_IPC_DIR` | `~/.claude/channels/local-ipc` | Root directory for inbox queues and registration files. |
+| `LOCAL_IPC_RENUDGE_MS` | `20000` | Interval between task re-nudges while open tasks persist. |
+| `LOCAL_IPC_RENUDGE_MAX` | `6` | Max task re-nudges before going quiet (record stays pullable via `my_tasks`). |
 
 ## License
 
