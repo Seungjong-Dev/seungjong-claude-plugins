@@ -125,7 +125,7 @@ const ALLOWED_FROM: Record<Exclude<TaskStatus, 'open'>, TaskStatus[]> = {
  * Move a task to `to`. Idempotent: already-in-`to` returns the current record
  * without rewriting. Invalid transitions throw with the current state. No
  * locking — writes are rename-atomic and concurrent edits degrade to
- * last-write-wins on `updated_at` (acceptable; mirrors server-side card triage).
+ * last-write-wins on `updated_at` (acceptable for low-contention coordination).
  */
 export function transitionTask(
   base: string,
