@@ -101,3 +101,27 @@ test('stampNudged writes nudged_at only on still-open records', () => {
   stampNudged(base, [r], START)
   expect(getTask(base, r.id)?.nudged_at).toBe(START)
 })
+
+import { gcTerminalTasks } from '../tasks'
+
+const DAY = 24 * 60 * 60 * 1000
+
+test('gcTerminalTasks deletes terminal tasks older than the TTL', () => {
+  const r = assignTask(base, { target: 'momo', title: 'old', createdBy: 'main' }, T0)
+  claimTask(base, r.id, T0)
+  completeTask(base, r.id, 'x', '2026-06-01T00:00:00.000Z') // updated 11 days before "now"
+  const now = Date.parse('2026-06-12T00:00:00.000Z')
+  expect(gcTerminalTasks(base, now, 7 * DAY)).toBe(1)
+  expect(getTask(base, r.id)).toBeNull()
+})
+
+test('gcTerminalTasks keeps recent terminal and all open tasks', () => {
+  const open = assignTask(base, { target: 'momo', title: 'open', createdBy: 'main' }, T0)
+  const recent = assignTask(base, { target: 'momo', title: 'recent', createdBy: 'main' }, T0)
+  claimTask(base, recent.id, T0)
+  completeTask(base, recent.id, 'x', '2026-06-11T00:00:00.000Z') // 1 day old
+  const now = Date.parse('2026-06-12T00:00:00.000Z')
+  expect(gcTerminalTasks(base, now, 7 * DAY)).toBe(0)
+  expect(getTask(base, open.id)).not.toBeNull()
+  expect(getTask(base, recent.id)).not.toBeNull()
+})

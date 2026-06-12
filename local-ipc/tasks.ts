@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'fs'
+import { readdirSync, readFileSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { primitiveDir, atomicWrite } from './store'
@@ -185,4 +185,26 @@ export function stampNudged(base: string, recs: TaskRecord[], nowIso: string): v
     if (!fresh || fresh.status !== 'open') continue
     atomicWrite(dir, file, JSON.stringify({ ...fresh, nudged_at: nowIso }, null, 2))
   }
+}
+
+export const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * Delete terminal tasks (done/failed/cancelled) whose `updated_at` is older than
+ * `ttlMs`. Open/claimed tasks are never collected. Returns the count removed.
+ */
+export function gcTerminalTasks(base: string, nowMs: number, ttlMs: number = DEFAULT_TTL_MS): number {
+  const dir = tasksDir(base)
+  let files: string[]
+  try { files = readdirSync(dir) } catch { return 0 }
+  let removed = 0
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue
+    const rec = _internal.readTaskFile(dir, f)
+    if (!rec || !TERMINAL.has(rec.status)) continue
+    if (nowMs - Date.parse(rec.updated_at) > ttlMs) {
+      try { unlinkSync(join(dir, f)); removed++ } catch {}
+    }
+  }
+  return removed
 }
