@@ -33,13 +33,23 @@ import {
 import { homedir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
+import { isValidAgentName } from './names'
+import { SCHEMA } from './schema'
+import {
+  tasksDir, assignTask, listTasks,
+  claimTask, completeTask, failTask, cancelTask,
+  tasksToNudge, stampNudged, gcTerminalTasks,
+} from './tasks'
+
+/** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
+const PROCESS_START_ISO = new Date().toISOString()
 
 const PLUGIN_VERSION = '0.1.1'
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
-if (!AGENT || !/^[a-z0-9_-]{1,32}$/.test(AGENT)) {
+if (!AGENT || !isValidAgentName(AGENT)) {
   process.stderr.write(
-    `local-ipc: LOCAL_IPC_AGENT_NAME required (lowercase alphanumeric, 1-32 chars). Set in launcher.\n`,
+    `local-ipc: LOCAL_IPC_AGENT_NAME required (lowercase alphanumeric/_/-, 1-32 chars, not a reserved name). Set in launcher.\n`,
   )
   process.exit(1)
 }
@@ -120,7 +130,7 @@ const mcp = new Server(
 )
 
 function recipientInbox(to: string): string {
-  if (!/^[a-z0-9_-]{1,32}$/.test(to)) {
+  if (!isValidAgentName(to)) {
     throw new Error(`invalid recipient name: ${to}`)
   }
   const dir = join(BASE, to, 'inbox')
@@ -201,6 +211,53 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: 'assign_task',
+      description:
+        'Create a durable, completion-tracked task for another agent (or yourself). ' +
+        'The target is nudged to call my_tasks. Use this when work must be tracked to done/failed; ' +
+        'use `send` for conversational messages that just need a reply.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target: { type: 'string', description: "Target agent name (their LOCAL_IPC_AGENT_NAME). Offline targets are queued." },
+          title: { type: 'string', description: 'Short task title. Max 200 chars.' },
+          body: { type: 'string', description: 'Optional detail.' },
+          priority: { type: 'number', description: 'Optional; higher sorts first. Default 0.' },
+        },
+        required: ['target', 'title'],
+      },
+    },
+    {
+      name: 'my_tasks',
+      description: 'List tasks targeted at you. Defaults to active (open + claimed). Pass `status` to filter.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['open', 'claimed', 'done', 'failed', 'cancelled'], description: 'Optional single status filter.' },
+        },
+      },
+    },
+    {
+      name: 'claim_task',
+      description: 'Mark one of your open tasks as claimed (you are working on it).',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    },
+    {
+      name: 'complete_task',
+      description: 'Mark a claimed task done, with an optional result string.',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' }, result: { type: 'string' } }, required: ['id'] },
+    },
+    {
+      name: 'fail_task',
+      description: 'Mark a claimed task failed, with an optional error string.',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' }, error: { type: 'string' } }, required: ['id'] },
+    },
+    {
+      name: 'cancel_task',
+      description: 'Cancel an open or claimed task (producer or target may cancel).',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    },
   ],
 }))
 
@@ -216,7 +273,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const inbox = recipientInbox(args.to)
     const ts = new Date().toISOString()
     const fname = `${ts.replace(/[:.]/g, '-')}-${randomUUID()}.json`
-    const payload = { from: AGENT, ts, text: args.text }
+    const payload = { schema_version: SCHEMA.message, from: AGENT, ts, text: args.text }
     writeFileSync(join(inbox, fname), JSON.stringify(payload), { mode: 0o600 })
     return { content: [{ type: 'text', text: `sent to ${args.to}` }] }
   }
@@ -227,6 +284,37 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         { type: 'text', text: JSON.stringify(agents, null, 2) },
       ],
     }
+  }
+  if (name === 'assign_task') {
+    const a = z
+      .object({ target: z.string(), title: z.string(), body: z.string().optional(), priority: z.number().optional() })
+      .parse(req.params.arguments ?? {})
+    const rec = assignTask(
+      BASE,
+      { target: a.target, title: a.title, body: a.body, priority: a.priority, createdBy: AGENT },
+      new Date().toISOString(),
+    )
+    return { content: [{ type: 'text', text: `task ${rec.id} created for ${rec.target}` }] }
+  }
+  if (name === 'my_tasks') {
+    const a = z
+      .object({ status: z.enum(['open', 'claimed', 'done', 'failed', 'cancelled']).optional() })
+      .parse(req.params.arguments ?? {})
+    const statuses = a.status ? [a.status] : (['open', 'claimed'] as const)
+    const tasks = listTasks(BASE, AGENT, [...statuses])
+    return { content: [{ type: 'text', text: JSON.stringify(tasks, null, 2) }] }
+  }
+  if (name === 'claim_task' || name === 'complete_task' || name === 'fail_task' || name === 'cancel_task') {
+    const a = z
+      .object({ id: z.string(), result: z.string().optional(), error: z.string().optional() })
+      .parse(req.params.arguments ?? {})
+    const now = new Date().toISOString()
+    const rec =
+      name === 'claim_task' ? claimTask(BASE, a.id, now)
+      : name === 'complete_task' ? completeTask(BASE, a.id, a.result, now)
+      : name === 'fail_task' ? failTask(BASE, a.id, a.error, now)
+      : cancelTask(BASE, a.id, now)
+    return { content: [{ type: 'text', text: `task ${rec.id} -> ${rec.status}` }] }
   }
   throw new Error(`unknown tool: ${name}`)
 })
@@ -311,4 +399,37 @@ watch(MY_INBOX, { persistent: true }, () => {
   drainInbox()
 })
 
-process.stderr.write(`local-ipc: agent=${AGENT} inbox=${MY_INBOX}\n`)
+// --- Task primitive: watch _store/tasks/ and nudge ourselves about open tasks. ---
+
+/** Deliver one coalesced nudge for our open-and-undelivered tasks, then stamp. */
+function nudgeTasks(): void {
+  if (!ownsInbox()) return // same single-owner gate as inbox drain
+  const open = listTasks(BASE, AGENT, ['open'])
+  const due = tasksToNudge(open, PROCESS_START_ISO)
+  if (due.length === 0) return
+  mcp
+    .notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `📥 You have ${open.length} open task(s). Call \`my_tasks\` to see them.`,
+        meta: { from: 'tasks', ts: new Date().toISOString() },
+      },
+    })
+    .catch(err => process.stderr.write(`local-ipc: failed to deliver task nudge: ${err}\n`))
+  stampNudged(BASE, due, new Date().toISOString())
+}
+
+// Coalesce bursty fs.watch events into one nudge pass.
+let nudgeTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleNudge(): void {
+  if (nudgeTimer) return
+  nudgeTimer = setTimeout(() => { nudgeTimer = null; nudgeTasks() }, 150)
+}
+
+// Reclaim disk from old terminal tasks, deliver queued nudges, then watch.
+mkdirSync(tasksDir(BASE), { recursive: true, mode: 0o700 })
+gcTerminalTasks(BASE, Date.now())
+nudgeTasks()
+watch(tasksDir(BASE), { persistent: true }, () => scheduleNudge())
+
+process.stderr.write(`local-ipc: agent=${AGENT} inbox=${MY_INBOX} tasks=${tasksDir(BASE)}\n`)
