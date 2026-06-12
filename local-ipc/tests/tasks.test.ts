@@ -37,3 +37,37 @@ test('listTasks filters by status; getTask finds by id across targets', () => {
   expect(getTask(base, r.id)?.id).toBe(r.id)
   expect(getTask(base, 'nope')).toBeNull()
 })
+
+import { claimTask, completeTask, failTask, cancelTask, transitionTask } from '../tasks'
+
+test('happy path open -> claimed -> done with result', () => {
+  const r = assignTask(base, { target: 'momo', title: 'a', createdBy: 'main' }, T0)
+  expect(claimTask(base, r.id, T0).status).toBe('claimed')
+  const done = completeTask(base, r.id, 'shipped', T0)
+  expect(done.status).toBe('done')
+  expect(done.result).toBe('shipped')
+})
+
+test('fail and cancel reach terminal states', () => {
+  const a = assignTask(base, { target: 'momo', title: 'a', createdBy: 'main' }, T0)
+  claimTask(base, a.id, T0)
+  expect(failTask(base, a.id, 'boom', T0).status).toBe('failed')
+  const b = assignTask(base, { target: 'momo', title: 'b', createdBy: 'main' }, T0)
+  expect(cancelTask(base, b.id, T0).status).toBe('cancelled') // open -> cancelled allowed
+})
+
+test('transition into the same status is an idempotent no-op', () => {
+  const r = assignTask(base, { target: 'momo', title: 'a', createdBy: 'main' }, T0)
+  claimTask(base, r.id, T0)
+  completeTask(base, r.id, 'x', T0)
+  expect(completeTask(base, r.id, 'ignored', '2026-06-12T01:00:00.000Z').result).toBe('x')
+})
+
+test('invalid transition rejects with current state', () => {
+  const r = assignTask(base, { target: 'momo', title: 'a', createdBy: 'main' }, T0)
+  expect(() => completeTask(base, r.id, 'x', T0)).toThrow(/open -> done/) // not claimed yet
+})
+
+test('transition on missing task throws not found', () => {
+  expect(() => claimTask(base, 'nope', T0)).toThrow(/not found/)
+})

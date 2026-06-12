@@ -113,3 +113,52 @@ export function getTask(base: string, id: string): TaskRecord | null {
 
 // --- internal helpers re-exported for sibling functions in later tasks ---
 export const _internal = { taskFilename, readTaskFile, findTaskFile }
+
+const ALLOWED_FROM: Record<Exclude<TaskStatus, 'open'>, TaskStatus[]> = {
+  claimed: ['open'],
+  done: ['claimed'],
+  failed: ['claimed'],
+  cancelled: ['open', 'claimed'],
+}
+
+/**
+ * Move a task to `to`. Idempotent: already-in-`to` returns the current record
+ * without rewriting. Invalid transitions throw with the current state. No
+ * locking — writes are rename-atomic and concurrent edits degrade to
+ * last-write-wins on `updated_at` (acceptable; mirrors server-side card triage).
+ */
+export function transitionTask(
+  base: string,
+  id: string,
+  to: Exclude<TaskStatus, 'open'>,
+  patch: { result?: string; error?: string },
+  nowIso: string,
+): TaskRecord {
+  const dir = tasksDir(base)
+  const file = _internal.findTaskFile(dir, id)
+  if (!file) throw new Error(`task not found: ${id}`)
+  const rec = _internal.readTaskFile(dir, file)
+  if (!rec) throw new Error(`task unreadable: ${id}`)
+  if (rec.status === to) return rec // idempotent no-op
+  if (!ALLOWED_FROM[to].includes(rec.status)) {
+    throw new Error(`invalid transition ${rec.status} -> ${to} for task ${id}`)
+  }
+  const next: TaskRecord = {
+    ...rec,
+    status: to,
+    updated_at: nowIso,
+    ...(patch.result !== undefined ? { result: patch.result } : {}),
+    ...(patch.error !== undefined ? { error: patch.error } : {}),
+  }
+  atomicWrite(dir, file, JSON.stringify(next, null, 2))
+  return next
+}
+
+export const claimTask = (base: string, id: string, now: string): TaskRecord =>
+  transitionTask(base, id, 'claimed', {}, now)
+export const completeTask = (base: string, id: string, result: string | undefined, now: string): TaskRecord =>
+  transitionTask(base, id, 'done', { result }, now)
+export const failTask = (base: string, id: string, error: string | undefined, now: string): TaskRecord =>
+  transitionTask(base, id, 'failed', { error }, now)
+export const cancelTask = (base: string, id: string, now: string): TaskRecord =>
+  transitionTask(base, id, 'cancelled', {}, now)
