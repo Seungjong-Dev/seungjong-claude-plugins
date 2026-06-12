@@ -115,9 +115,12 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 // but the transport never notices — leaving this process orphaned (ppid=1) still
 // watching inboxes. Stacked across reloads, those zombie watchers each drain and
 // deliver, causing duplicate messages. Treat stdin end/close as a disconnect and
-// reap ourselves so only one live watcher per agent survives.
-process.stdin.on('end', releaseAndExit)
-process.stdin.on('close', releaseAndExit)
+// reap ourselves so only one live watcher per agent survives. Skip when stdin is
+// a TTY (a dev running server.ts by hand) so Ctrl+D doesn't look like a disconnect.
+if (!process.stdin.isTTY) {
+  process.stdin.on('end', releaseAndExit)
+  process.stdin.on('close', releaseAndExit)
+}
 
 const mcp = new Server(
   { name: 'local-ipc', version: PLUGIN_VERSION },
@@ -403,12 +406,12 @@ function drainInbox(): void {
   }
 }
 
-// Only once the client finishes initializing can it actually receive channel
-// notifications. Deliver anything queued while we were offline here, rather than
-// firing the initial task nudge blindly at boot (which races the not-yet-ready
-// connection). Idempotent: drainInbox unlinks; nudgeTasks stamps + self-heals.
+// The initial task nudge must wait until the client can actually receive channel
+// notifications; firing it at boot races the not-yet-ready connection, which left
+// offline-queued tasks undelivered on launch/reconnect. Messages don't need this
+// (they drain at startup and via the inbox watch). nudgeTasks is idempotent — it
+// stamps nudged_at and self-heals stale stamps left by a prior owner.
 mcp.oninitialized = () => {
-  drainInbox()
   nudgeTasks()
 }
 
