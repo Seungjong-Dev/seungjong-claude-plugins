@@ -33,8 +33,12 @@ import {
 import { homedir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
+import { execFileSync } from 'child_process'
 import { isValidAgentName } from './names'
 import { SCHEMA } from './schema'
+import {
+  shouldSelfReap, shouldReapPredecessor, parseProcStart, type Registration,
+} from './reap'
 import {
   tasksDir, assignTask, listTasks,
   claimTask, completeTask, failTask, cancelTask,
@@ -44,7 +48,16 @@ import {
 /** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
 const PROCESS_START_ISO = new Date().toISOString()
 
-const PLUGIN_VERSION = '0.2.3'
+const PLUGIN_VERSION = '0.2.4'
+
+// Reaping config (env-overridable for tests). REAP_PREDECESSOR gates the
+// startup active kill (B); SELFCHECK gates the periodic ownership self-exit (A).
+// Set either to its disable value to isolate one mechanism under test.
+const REAP_PREDECESSOR = process.env.LOCAL_IPC_REAP_PREDECESSOR !== '0'
+const REAP_GRACE_MS =
+  process.env.LOCAL_IPC_REAP_GRACE_MS !== undefined ? Number(process.env.LOCAL_IPC_REAP_GRACE_MS) : 2_000
+const SELFCHECK_INTERVAL_MS =
+  process.env.LOCAL_IPC_SELFCHECK_MS !== undefined ? Number(process.env.LOCAL_IPC_SELFCHECK_MS) : 15_000
 
 const AGENT = process.env.LOCAL_IPC_AGENT_NAME
 if (!AGENT || !isValidAgentName(AGENT)) {
@@ -76,22 +89,51 @@ function writeRegistration(): void {
   writeFileSync(MY_REGISTRATION, JSON.stringify(payload, null, 2), { mode: 0o600 })
 }
 
-// If another live process already claims this agent name, it's likely an
-// orphan from a previous session (e.g. a stale --bg-spare that inherited our
-// env). We still take ownership — last writer wins — and the pid checks in
-// ownsInbox()/the signal handlers neutralize the stale process from then on.
+/**
+ * (B) Actively reap a superseded predecessor. The disconnect→reconnect path
+ * spawns us alongside the old server without closing its stdin, so its stdin-EOF
+ * self-reap never fires (see comment below) — we must take it down ourselves.
+ * SIGTERM lets it run its own releaseAndExit (which preserves OUR registration,
+ * since it only unlinks when it still owns the file); a SIGKILL fallback after a
+ * grace handles a wedged process. The grace timer re-verifies identity so a pid
+ * recycled during the window is never the friendly-fire victim.
+ */
+function reapPredecessor(prev: Registration): void {
+  process.stderr.write(
+    `local-ipc: reaping superseded predecessor pid ${prev.pid} for "${AGENT}" (SIGTERM, SIGKILL after ${REAP_GRACE_MS}ms)\n`,
+  )
+  try { process.kill(prev.pid, 'SIGTERM') } catch {}
+  setTimeout(() => {
+    // Re-run the full guard: if it's still our live predecessor, finish the job.
+    if (shouldReapPredecessor(prev, process.pid, isPidAlive, procStartMs)) {
+      try { process.kill(prev.pid, 'SIGKILL') } catch {}
+    }
+  }, REAP_GRACE_MS).unref?.()
+}
+
+// A previous registration for our agent name means an earlier session. Claim
+// ownership FIRST (writeRegistration) so that when we SIGTERM the predecessor,
+// its releaseAndExit sees it no longer owns the file and leaves our registration
+// intact. Then, if it's a verifiable live predecessor, reap it (B) so only one
+// watcher per agent survives; otherwise fall back to advisory takeover —
+// ownsInbox() and the self-check (A) neutralize whatever we can't positively id.
+let predecessor: Registration | null = null
 try {
-  const prev = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
-  if (prev.pid !== process.pid && isPidAlive(prev.pid)) {
-    process.stderr.write(
-      `local-ipc: agent "${AGENT}" already registered by live pid ${prev.pid}; ` +
-        `taking over ownership as pid ${process.pid} (stale process will stop draining)\n`,
-    )
-  }
+  predecessor = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
 } catch {
-  // No previous registration (or unreadable) — nothing to warn about.
+  predecessor = null // no previous registration (or unreadable) — nothing to reap.
 }
 writeRegistration()
+if (predecessor) {
+  if (REAP_PREDECESSOR && shouldReapPredecessor(predecessor, process.pid, isPidAlive, procStartMs)) {
+    reapPredecessor(predecessor)
+  } else if (predecessor.pid !== process.pid && isPidAlive(predecessor.pid)) {
+    process.stderr.write(
+      `local-ipc: agent "${AGENT}" already registered by live pid ${predecessor.pid}; ` +
+        `taking over ownership as pid ${process.pid} (could not verify for reap; stale process will stop draining)\n`,
+    )
+  }
+}
 
 // Graceful cleanup — remove our registration so peers immediately see us as
 // gone. Non-graceful exits (SIGKILL, crash) will leave the file; next startup
@@ -120,6 +162,32 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 if (!process.stdin.isTTY) {
   process.stdin.on('end', releaseAndExit)
   process.stdin.on('close', releaseAndExit)
+}
+
+// (A) Periodic ownership self-check. The stdin-EOF reap above only fires when
+// the parent actually closes our stdin; a disconnect→reconnect spawns a fresh
+// server beside us and leaves our stdin open, so EOF never comes. Instead, poll
+// our own registration: once a newer, live pid owns it, we are by definition the
+// superseded orphan — exit. releaseAndExit() won't touch the file (it only
+// unlinks when WE own it), so the live owner's registration is preserved. Runs
+// regardless of clientReady so an orphan that never initialized still reaps.
+function selfCheckOwnership(): void {
+  let reg: Registration | null = null
+  try {
+    reg = JSON.parse(readFileSync(MY_REGISTRATION, 'utf8')) as Registration
+  } catch {
+    reg = null // missing/corrupt — ownsInbox() reclaims; nothing to self-reap.
+  }
+  if (shouldSelfReap(reg, process.pid, isPidAlive)) {
+    process.stderr.write(
+      `local-ipc: registration for "${AGENT}" taken over by live pid ${reg!.pid}; ` +
+        `self-reaping superseded orphan pid ${process.pid}\n`,
+    )
+    releaseAndExit()
+  }
+}
+if (SELFCHECK_INTERVAL_MS > 0) {
+  setInterval(selfCheckOwnership, SELFCHECK_INTERVAL_MS).unref?.()
 }
 
 const mcp = new Server(
@@ -157,20 +225,22 @@ function recipientInbox(to: string): string {
   return dir
 }
 
-type Registration = {
-  name: string
-  pid: number
-  version: string
-  registered_at: string
-  alive?: boolean
-}
-
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
   } catch {
     return false
+  }
+}
+
+/** OS-reported start time of `pid` in epoch ms, or null if it can't be read. */
+function procStartMs(pid: number): number | null {
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' })
+    return parseProcStart(out)
+  } catch {
+    return null // no such process / ps unavailable
   }
 }
 
