@@ -1,0 +1,6 @@
+{
+  "name": "cete-tasks",
+  "description": "Durable, completion-tracked task tools for co-located Claude Code agents — assign_task / my_tasks / claim_task / complete_task / fail_task / cancel_task, served as a thin client over cete-os-server's REST API (SQLite SSOT). Agent identity reuses LOCAL_IPC_AGENT_NAME.",
+  "version": "0.1.0",
+  "keywords": ["tasks", "multi-agent", "coordination", "orchestration", "agent", "mcp", "cete"]
+}

@@ -13,6 +13,14 @@
       "version": "0.1.0",
       "category": "channel",
       "keywords": ["ipc", "channel", "multi-agent", "mcp"]
+    },
+    {
+      "name": "cete-tasks",
+      "source": "./cete-tasks",
+      "description": "Durable, completion-tracked task tools (assign_task / my_tasks / claim_task / complete_task / fail_task / cancel_task) for co-located Claude Code agents — a thin MCP client over cete-os-server's REST API. Drop-in replacement for local-ipc's pre-0.3.0 task primitive; agent identity reuses LOCAL_IPC_AGENT_NAME.",
+      "version": "0.1.0",
+      "category": "task",
+      "keywords": ["tasks", "multi-agent", "coordination", "orchestration", "mcp", "cete"]
     }
   ]
 }
