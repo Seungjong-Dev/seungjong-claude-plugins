@@ -1,5 +1,5 @@
 /** Record schema versions per primitive. Bump on any breaking record change. */
-export const SCHEMA = { message: 1, task: 1, event: 1 } as const
+export const SCHEMA = { message: 1 } as const
 export type Primitive = keyof typeof SCHEMA
 
 /**
