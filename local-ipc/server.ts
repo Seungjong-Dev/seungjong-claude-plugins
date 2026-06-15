@@ -16,6 +16,11 @@
  * startup the server also publishes a `registered.json` under its own
  * directory so peers can discover active agents without needing to know
  * names in advance.
+ *
+ * This is a pure 1:1 message channel. Durable, completion-tracked tasks are
+ * owned by cete-os-server (SQLite SSOT + REST), which delivers its nudges as
+ * ordinary `from="tasks"` messages dropped into the same inbox — so the
+ * message contract here (path layout, payload keys, watch→drain) is frozen.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -39,16 +44,8 @@ import { SCHEMA } from './schema'
 import {
   shouldSelfReap, shouldReapPredecessor, parseProcStart, type Registration,
 } from './reap'
-import {
-  tasksDir, assignTask, listTasks,
-  claimTask, completeTask, failTask, cancelTask,
-  tasksToNudge, stampNudged, gcTerminalTasks,
-} from './tasks'
 
-/** Captured once at boot — used to re-nudge tasks stamped by a prior owner. */
-const PROCESS_START_ISO = new Date().toISOString()
-
-const PLUGIN_VERSION = '0.2.4'
+const PLUGIN_VERSION = '0.3.0'
 
 // Reaping config (env-overridable for tests). REAP_PREDECESSOR gates the
 // startup active kill (B); SELFCHECK gates the periodic ownership self-exit (A).
@@ -200,14 +197,11 @@ const mcp = new Server(
       },
     },
     instructions: [
-      `You are agent "${AGENT}" on the local-ipc coordination channel.`,
+      `You are agent "${AGENT}" on the local-ipc message channel.`,
       '',
-      'Two coordination primitives — pick by intent:',
-      '- Message (`send`): 1:1, ephemeral, best-effort (at-most-once). Use for replies / conversation. A message sent to an offline peer can be missed on its reconnect — do not use messages for work that must not be lost.',
-      '- Task (`assign_task`, then `my_tasks` / `claim_task` / `complete_task` / `fail_task` / `cancel_task`): 1:1, durable, tracked to completion. Use when delegating work that must be tracked or must survive the target being offline.',
-      'Boundary rule: needs a reply → message; needs completion-tracking or guaranteed delivery → task.',
+      'Send a 1:1 message to another agent with the `send` tool. Delivery is best-effort (at-most-once): a message to an offline peer queues in their inbox and drains on their next launch, but the wake push only lands once the session is in steady-state idle-listening, so a message delivered during that startup window can be missed. Do not use messages for work that must not be lost.',
       '',
-      'Incoming messages arrive as <channel source="local-ipc" from="..." ts="...">. A task nudge arrives from "tasks" telling you to call `my_tasks`.',
+      'Incoming messages arrive as <channel source="local-ipc" from="..." ts="...">.',
       '',
       'Use the `list_agents` tool to discover which peers are currently registered.',
       '',
@@ -300,53 +294,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
-    {
-      name: 'assign_task',
-      description:
-        'Create a durable, completion-tracked task for another agent (or yourself). ' +
-        'The target is nudged to call my_tasks. Use this when work must be tracked to done/failed; ' +
-        'use `send` for conversational messages that just need a reply.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          target: { type: 'string', description: "Target agent name (their LOCAL_IPC_AGENT_NAME). Offline targets are queued." },
-          title: { type: 'string', description: 'Short task title. Max 200 chars.' },
-          body: { type: 'string', description: 'Optional detail.' },
-          priority: { type: 'number', description: 'Optional; higher sorts first. Default 0.' },
-        },
-        required: ['target', 'title'],
-      },
-    },
-    {
-      name: 'my_tasks',
-      description: 'List tasks targeted at you. Defaults to active (open + claimed). Pass `status` to filter.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          status: { type: 'string', enum: ['open', 'claimed', 'done', 'failed', 'cancelled'], description: 'Optional single status filter.' },
-        },
-      },
-    },
-    {
-      name: 'claim_task',
-      description: 'Mark one of your open tasks as claimed (you are working on it).',
-      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
-    },
-    {
-      name: 'complete_task',
-      description: 'Mark a claimed task done, with an optional result string.',
-      inputSchema: { type: 'object', properties: { id: { type: 'string' }, result: { type: 'string' } }, required: ['id'] },
-    },
-    {
-      name: 'fail_task',
-      description: 'Mark a claimed task failed, with an optional error string.',
-      inputSchema: { type: 'object', properties: { id: { type: 'string' }, error: { type: 'string' } }, required: ['id'] },
-    },
-    {
-      name: 'cancel_task',
-      description: 'Cancel an open or claimed task (producer or target may cancel).',
-      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
-    },
   ],
 }))
 
@@ -373,37 +320,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         { type: 'text', text: JSON.stringify(agents, null, 2) },
       ],
     }
-  }
-  if (name === 'assign_task') {
-    const a = z
-      .object({ target: z.string(), title: z.string(), body: z.string().optional(), priority: z.number().optional() })
-      .parse(req.params.arguments ?? {})
-    const rec = assignTask(
-      BASE,
-      { target: a.target, title: a.title, body: a.body, priority: a.priority, createdBy: AGENT },
-      new Date().toISOString(),
-    )
-    return { content: [{ type: 'text', text: `task ${rec.id} created for ${rec.target}` }] }
-  }
-  if (name === 'my_tasks') {
-    const a = z
-      .object({ status: z.enum(['open', 'claimed', 'done', 'failed', 'cancelled']).optional() })
-      .parse(req.params.arguments ?? {})
-    const statuses = a.status ? [a.status] : (['open', 'claimed'] as const)
-    const tasks = listTasks(BASE, AGENT, [...statuses])
-    return { content: [{ type: 'text', text: JSON.stringify(tasks, null, 2) }] }
-  }
-  if (name === 'claim_task' || name === 'complete_task' || name === 'fail_task' || name === 'cancel_task') {
-    const a = z
-      .object({ id: z.string(), result: z.string().optional(), error: z.string().optional() })
-      .parse(req.params.arguments ?? {})
-    const now = new Date().toISOString()
-    const rec =
-      name === 'claim_task' ? claimTask(BASE, a.id, now)
-      : name === 'complete_task' ? completeTask(BASE, a.id, a.result, now)
-      : name === 'fail_task' ? failTask(BASE, a.id, a.error, now)
-      : cancelTask(BASE, a.id, now)
-    return { content: [{ type: 'text', text: `task ${rec.id} -> ${rec.status}` }] }
   }
   throw new Error(`unknown tool: ${name}`)
 })
@@ -479,14 +395,13 @@ function drainInbox(): void {
 // Deliver nothing until the client finishes initializing. Pre-init channel
 // notifications are dropped by the client (confirmed: a reconnect nudge fired at
 // ~116ms was lost), and draining the inbox pre-init would unlink offline messages
-// into the void. So the initial drain + nudge AND the watch callbacks are gated on
+// into the void. So the initial drain AND the watch callbacks are gated on
 // clientReady: pre-init arrivals are caught by this initial scan, later ones by the
-// watches. drainInbox unlinks; nudgeTasks stamps + self-heals — both idempotent.
+// watches. drainInbox unlinks, but is idempotent.
 let clientReady = false
 mcp.oninitialized = () => {
   clientReady = true
   drainInbox()
-  nudgeTasks()
 }
 
 const transport = new StdioServerTransport()
@@ -499,69 +414,4 @@ watch(MY_INBOX, { persistent: true }, () => {
   if (clientReady) drainInbox()
 })
 
-// --- Task primitive: watch _store/tasks/ and nudge ourselves about open tasks. ---
-
-// A channel nudge only triggers an agent turn once the session is in steady-state
-// idle-listening, which is later than the MCP init handshake — so the first nudge
-// can fire too early to wake an idle agent. We re-send a bounded reminder while
-// open tasks persist (env-overridable for tests). The durable record is the safety
-// net: after the budget is spent the agent can still find tasks via my_tasks.
-// Explicit undefined check (not `|| default`) so `LOCAL_IPC_RENUDGE_MAX=0` can
-// disable reminders rather than silently falling back to the default.
-const RENUDGE_INTERVAL_MS = process.env.LOCAL_IPC_RENUDGE_MS !== undefined ? Number(process.env.LOCAL_IPC_RENUDGE_MS) : 20_000
-const MAX_RENUDGES = process.env.LOCAL_IPC_RENUDGE_MAX !== undefined ? Number(process.env.LOCAL_IPC_RENUDGE_MAX) : 6
-
-/** Send one coalesced "you have N open task(s)" wake notification. */
-function sendTaskNudge(count: number): void {
-  mcp
-    .notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content: `📥 You have ${count} open task(s). Call \`my_tasks\` to see them.`,
-        meta: { from: 'tasks', ts: new Date().toISOString() },
-      },
-    })
-    .catch(err => process.stderr.write(`local-ipc: failed to deliver task nudge: ${err}\n`))
-}
-
-/** Immediate nudge for newly-arrived or prior-owner-stamped open tasks, then stamp. */
-function nudgeTasks(): void {
-  if (!ownsInbox()) return // same single-owner gate as inbox drain
-  const open = listTasks(BASE, AGENT, ['open'])
-  const due = tasksToNudge(open, PROCESS_START_ISO)
-  if (due.length === 0) return
-  sendTaskNudge(open.length)
-  stampNudged(BASE, due, new Date().toISOString())
-}
-
-// Periodic reminder so a nudge that fired before the agent was wake-ready still
-// lands. Budget refills once the agent catches up (no open tasks), so a later
-// batch gets fresh reminders; while exhausted we stay quiet and rely on my_tasks.
-let remindBudget = MAX_RENUDGES
-function remindOpenTasks(): void {
-  if (!clientReady || !ownsInbox()) return
-  const open = listTasks(BASE, AGENT, ['open'])
-  if (open.length === 0) { remindBudget = MAX_RENUDGES; return }
-  if (remindBudget <= 0) return
-  remindBudget--
-  sendTaskNudge(open.length)
-}
-setInterval(remindOpenTasks, RENUDGE_INTERVAL_MS).unref?.()
-
-// Coalesce bursty fs.watch events into one nudge pass.
-let nudgeTimer: ReturnType<typeof setTimeout> | null = null
-function scheduleNudge(): void {
-  if (nudgeTimer) return
-  nudgeTimer = setTimeout(() => { nudgeTimer = null; nudgeTasks() }, 150)
-}
-
-// Reclaim disk from old terminal tasks, then watch for new ones. The initial
-// nudge for already-queued tasks is delivered from mcp.oninitialized (above),
-// once the client is ready to receive it.
-mkdirSync(tasksDir(BASE), { recursive: true, mode: 0o700 })
-gcTerminalTasks(BASE, Date.now())
-watch(tasksDir(BASE), { persistent: true }, () => {
-  if (clientReady) scheduleNudge()
-})
-
-process.stderr.write(`local-ipc: agent=${AGENT} inbox=${MY_INBOX} tasks=${tasksDir(BASE)}\n`)
+process.stderr.write(`local-ipc: agent=${AGENT} inbox=${MY_INBOX}\n`)
